@@ -205,6 +205,17 @@ pub fn maybe_dump_adapters() {
     }
 }
 
+/// 选定适配器的「名称 | 后端 | 类型」单行摘要（供 bench 等工具打印）。
+pub fn dump_adapters_env() -> String {
+    let inst = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: backend_from_env(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let a = pick_adapter(&inst);
+    let i = a.get_info();
+    format!("{} | {:?} | {:?}", i.name, i.backend, i.device_type)
+}
+
 impl GpuVad {
     pub fn new(w: &Weights) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
