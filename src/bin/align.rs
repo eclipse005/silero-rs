@@ -55,12 +55,8 @@ fn main() {
         .filter_map(|e| {
             let p = e.ok()?.path();
             let n = p.file_name()?.to_str()?.to_string();
-            // 只取 vNN.f32（跳过 vNN.probs*.f32 等）
-            if n.ends_with(".f32")
-                && !n.contains(".probs")
-                && n.starts_with('v')
-                && n[..n.len() - 4].chars().skip(1).all(|c| c.is_ascii_digit())
-            {
+            // 音频本体 = *.f32 且非 golden 派生（*.probs.f32 / *.probs_cuda.f32）
+            if n.ends_with(".f32") && !n.contains(".probs") {
                 Some(n[..n.len() - 4].to_string())
             } else {
                 None
