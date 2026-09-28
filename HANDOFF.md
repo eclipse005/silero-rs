@@ -10,8 +10,9 @@
 ## 1. 任务与现状一句话
 
 把 `D:\silero-rs`（Silero VAD 的 Rust 移植，CPU SIMD + wgpu GPU 双后端）的 **GPU 路径 RTFx** 提上去。
-当前集显（Intel iGPU / Vulkan）RTFx ≈ 512–590，**低于**同机单线程 CPU 路径（485–827，波动大），
-独显（GTX 1070 / Vulkan）≈ 1144。
+2026-09 优化后：Intel 集显单流 RTFx ≈ 930–1000（原 512–590），已高于同机单线程 CPU（485–827）；
+GTX 1070 单流 ≈ 1460（原 1104–1144）。公开 API 未变（`stream`/`frame_batch`，与原版对齐），
+全部提速来自 kernel 内部的逐位等价重排。
 
 ---
 
@@ -97,7 +98,7 @@ Vulkan    Loader 1.4.313.0 (C:\Windows\System32\vulkan-1.dll)
 | `src/lib.rs` | host CPU 路径（SIMD）、`SileroVad`、`Weights`、`CFG_16K/8K` |
 | `src/gpu.rs` | **逐帧** GPU 路径 `GpuVad`（`gpu.wgsl`，8 dispatch/帧）。**当前无任何 bin 引用，是死代码** |
 | `src/gpu_batch.rs` | **批量** GPU 路径 `GpuBatch`（`gpu_batch.wgsl`）。CLI / align / bench 实际走的路径 |
-| `src/gpu_batch.wgsl` | 批量 kernels（模板，`{BATCH}` 等占位由 Rust 注入） |
+| `src/gpu_batch.wgsl` | 批量 kernels（模板，`{BATCH}`/`{LSTM_CHUNKS}` 等占位由 Rust 注入） |
 | `src/wgsl_math.wgsl` | 厂商无关超越函数层，注入到上面两个 shader 前面 |
 | `src/transcendental.rs` | 同上算法的 host 镜像 |
 | `src/bin/bench.rs` | **基线工具**：逐 kernel 占比 / 单批墙钟 / 批大小扫描 / 端到端 RTFx |
@@ -110,21 +111,27 @@ Vulkan    Loader 1.4.313.0 (C:\Windows\System32\vulkan-1.dll)
 
 常量：`MAX_T = 512`（每批帧数）、`LSTM_CHUNK = 32`（每个 dispatch 串行处理的帧数）。
 
-一个满批（T=512）共 **22 个 dispatch + 1 次 submit + 1 次 map_async**：
+一个满批（T=512）共 **23 个 dispatch（6 conv + 16 lstm chunk + 1 prob）+ 1 次 submit +
+1 次 map_async**：
 
 | # | kernel | 线程数 (T=512) | workgroup 数 | 说明 |
 |---|---|---|---|---|
-| 0 | `main_stft` | 264192 | 4128 | x640 → mag，workgroup_size 64 |
+| 0 | `main_stft` | 264192 | 4128 | x640 → mag，workgroup_size 64，2D dispatch（防 65535 上限） |
 | 1 | `main_conv1` | 262144 | 4096 | 128 输出通道 |
 | 2 | `main_conv2` | 65536 | 1024 | |
 | 3 | `main_conv3` | 32768 | 512 | |
 | 4 | `main_conv4` | 65536 | 1024 | |
 | 5 | `main_gates_in` | 262144 | 4096 | Wih@e4 |
 | 6..21 | `lstm_chunk_0..15` | 256 | **1（每个）** | **单 workgroup，串行 32 帧** |
+| 22 | `main_prob` | 128×T | T | fw·relu(h) 顺序归约 + sigmoid（每帧 1 个 workgroup(128)） |
 
-- 前 5 个 conv + stft + gates_in：逐帧独立，已批量化。
-- **LSTM 递归不可并行**，当前做法是每 32 帧打包进 1 个 dispatch，单 workgroup(256) 内 for 循环串行。
-- 每帧 2 次 `workgroupBarrier()`；跨帧 h/c 状态放在 **workgroup 内存**（`wg_h`/`wg_c`），chunk 首尾与 `b_h`/`b_c` 搬运一次。
+- 前 5 个 conv + stft + gates_in：逐帧独立。**显式软件流水**（先取 ic+4..ic+7 的权重/激活，
+  再做本拍 FMA）+ **conv 权重 host 侧重排** `[co][ic][k]→[co][k][ic]`（线程沿 ic 连续读）。
+  Intel 集显上 conv 曾是隐藏的最大瓶颈（见 §9）。
+- **LSTM 递归不可并行**，每 32 帧打包进 1 个 dispatch，单 workgroup(256) 内 for 循环串行；
+  每帧 2 次 `workgroupBarrier()`；跨帧 h/c 在 workgroup 内存，chunk 首尾与 `b_h`/`b_c` 搬运一次。
+- prob 从递归循环拆出为批量 kernel：与旧 in-loop 归约**逐位一致**（乘积先存 workgroup
+  内存、线程 0 顺序累加 128 项 + sigmoid）。
 - 流水深度为 **1**：`frame_batch` 先给上一批注册 map，再提交本批，然后收割上一批。
 
 ### 缓冲区（T=512 时）
@@ -132,17 +139,18 @@ Vulkan    Loader 1.4.313.0 (C:\Windows\System32\vulkan-1.dll)
 | buffer | 字节 | 用途 |
 |---|---|---|
 | `x` / `x_alt` | 1310720 各一 | 输入（ctx64 + frame512 + pad64 = 640/帧），双缓冲交替 |
-| `W` | 1238532 | 15 个权重张量 concat，只读 |
+| `W` | 1238532 | 15 个权重张量 concat（conv 已重排、whh 已转置），只读 |
 | `mag` | 1058816 | stft 输出 |
 | `e1` | 1050624 | |
 | `e2` / `e4` | 264192 各一 | |
 | `e3` | 133120 | |
 | `gin` | 1179648 | Wih@e4 + bih |
 | `h` / `c` | 512 各一 | LSTM 递归状态，常驻 GPU |
-| `prob` | 524288 | 行距 64 f32 = 256 B/帧（首 f32 有效） |
-| `staging[2]` | 524288 各一 | 读回缓冲，双缓冲 |
+| `prob` | 131072 | 行距 64 f32 = 256 B/帧（首 f32 有效） |
+| `h_all` | 262144 | 每帧 h 快照（lstm 写，main_prob 读） |
+| `staging[2]` | 131072 各一 | 读回缓冲，双缓冲 |
 
-合计约 9 MiB。
+合计约 9.5 MiB。
 
 ### 计算量（16k，每帧单块 T=1）
 
@@ -183,6 +191,7 @@ GPU 的**硬件**超越函数不可复现：同一份 WGSL 在 Intel 与 NVIDIA 
 | 10 变体 gate | `ts=OK diff=OK`，prob diff ≤ ~1e-4 | PASS（最大 1.67e-5） |
 | 四路 align（8 段视频） | 时间戳 4-way 逐段精确相等 | **Intel PASS / NVIDIA PASS** |
 | `cargo test` | 全绿 | PASS |
+| 逐位回归 | 优化后 GPU 概率流与旧实现 **byte-exact**（v01 47665 帧 + v02 25842 帧，`trace --dump` 比对） | PASS |
 | 修复前后对照 | Intel：22695 帧 >1e-5 → **7 帧**；时间戳 555 → **567 = golden** | — |
 
 ### ⚠️ 60s 用例抓不到这类缺陷
@@ -196,39 +205,37 @@ GPU 的**硬件**超越函数不可复现：同一份 WGSL 在 Intel 与 NVIDIA 
 
 RTFx = 音频时长 / 墙钟时间，>1 表示快于实时。测量对象：`ref/video/v01.f32`，1525.2s。
 
-### 端到端
+### 端到端（2026-09 优化后）
 
 | 路径 | RTFx | 每帧 |
 |---|---|---|
 | Rust CPU 单线程（AVX2+FMA） | 485 – 827（**波动大，见 §9**） | 38.7 – 66.0 µs |
-| **Rust GPU / Intel iGPU / Vulkan** | **512 – 590** | **54.6 – 58.9 µs** |
-| Rust GPU / GTX 1070 / Vulkan | 1104 – 1144 | 28.0 – 34.3 µs |
+| **Rust GPU / Intel iGPU / Vulkan** | **930 – 1000** | **31.9 – 33 µs** |
+| Rust GPU / GTX 1070 / Vulkan | ≈ 1460 | 21.9 µs |
 | Python 原版 CPU 单线程 | ≈ 117 | — |
 
-`align` 逐段 RTFx（rtfx_cpu/rtfx_gpu）：
+优化前基线（供对照）：Intel 单流 512–590（54.6–58.9 µs/帧），1070 单流 1104–1144。
+
+`align` 逐段 RTFx（rtfx_cpu/rtfx_gpu，2026-09 优化后）：
 
 | fixture | Intel 集显 | GTX 1070 |
 |---|---|---|
-| v01 (47665 帧) | 590 / 562 | 649 / 1139 |
-| v02 | 537 / 556 | 586 / 1137 |
-| v03 | 467 / 556 | 571 / 1127 |
-| v04 | 498 / 552 | 570 / 1138 |
-| v05 | 551 / 559 | 580 / 1107 |
-| v06 | 535 / 564 | 570 / 1104 |
-| v07 | 537 / 556 | 541 / 1124 |
-| v08 | 531 / 554 | 564 / 1123 |
+| v01 (47665 帧) | 823 / 929 | 803 / 1462 |
+| v02 | 813 / 933 | 824 / 1456 |
+| v03 | 808 / 830 | 818 / 1444 |
+| v04 | 814 / 914 | 814 / 1461 |
+| v05 | 825 / 929 | 822 / 1400 |
+| v06 | 829 / 927 | 785 / 1396 |
+| v07 | 831 / 932 | 827 / 1434 |
+| v08 | 814 / 931 | 829 / 1438 |
 
-### 逐 kernel 时间占比（满批 T=512，**占比可靠，绝对值不可信**，见 §9）
+### 逐 kernel 时间占比（⚠️ 不可信，勿再用它定位）
 
-| kernel | Intel 占比 | NVIDIA 占比 |
-|---|---|---|
-| stft | 0.4% | 0.4% |
-| conv1 | 0.9% | 1.0% |
-| conv2 | 0.7% | 0.8% |
-| conv3 | 0.2% | 0.3% |
-| conv4 | 0.1% | 0.2% |
-| gates_in | 0.2% | 0.3% |
-| **lstm** | **97.6%** | **97.1%** |
+优化前的占比表声称 lstm 97.6%、conv 合计 2.4% —— **这是错的**（timestamp 周期按 1ns 折算
+导致的假象，Intel 上占比也不可靠）。真实占比（host 墙钟逐 kernel 实测，优化前满批 512 帧）：
+conv 合计 ≈ 18.7ms（conv1 8.4 / stft 3.9 / gates_in 3.6 / conv2 1.8 / conv3+4 各 0.5）、
+LSTM+prob ≈ 10.7ms。**定位瓶颈只能用 host 墙钟 + 逐 kernel 单独 dispatch（SILERO_ONLY 式
+探针）或逐个跳过 dispatch，不要信 timestamp。**
 
 ### 单批墙钟（host 侧，不依赖时间戳）
 
@@ -288,17 +295,33 @@ cargo build --release --features gpu   # 输出里应出现 "Compiling silero-va
 
 ## 9. 已知坑（会浪费你时间的地方）
 
-1. **`debug_timing` 的绝对毫秒不可信**。它按「1 tick = 1 ns」折算，但各适配器 `timestampPeriod`
-   不同（实测 Intel 与 NVIDIA 差 ~150×）。**只有占比是可靠的**。需要绝对值时用 host 墙钟。
-2. **`Copy-Item` 会保留源文件 mtime**。用备份覆盖被改文件后 cargo 可能认为没变化而不重编，
+1. **`debug_timing` 的绝对毫秒不可信，Intel 上连占比都不可信**。它按「1 tick = 1 ns」折算，
+   但各适配器 `timestampPeriod` 不同（实测 Intel 与 NVIDIA 差 ~150×）。优化前它声称
+   lstm 占 97.6%、conv 占 2.4%，而 host 墙钟实测 conv 才是大头 —— 这误导了两轮优化。
+   **定位瓶颈：host 墙钟 + 单独 dispatch/跳过 dispatch 的探针。**
+2. **本机 Intel 集显的奇特执行模型**（Xe iGPU，驱动 101.8860，实测规律）：
+   - 单 workgroup 的串行帧循环每帧有 ~38µs 的固定下限（掏空循环体也一样）——负载太低，
+     频率/调度不上去了；这正是当初集显跑不过 CPU 的根因。
+   - conv 的行间并行度几乎为 0（每行 ~21-37µs，不随行数变快）；LSTM 若开多个 workgroup
+     则可完美并行（实测 k≤16 墙钟与 k=1 持平）——当前单流用不到，留作将来参考。
+   - **workgroup_size(512) 会严重劣化**（LSTM 与 conv 都试过，256/64 反而快），
+     最终用 64（conv）/256（lstm）。
+   - conv 全部走 2D dispatch（shader 用 `num_workgroups` 折算线性 idx，防 1D dispatch
+     的 65535 workgroup 上限）。
+3. **`Copy-Item` 会保留源文件 mtime**。用备份覆盖被改文件后 cargo 可能认为没变化而不重编，
    导致测的还是旧代码。用 `(Get-Item x).LastWriteTime = Get-Date` 强制触发。
-3. **CPU RTFx 噪声大**（485–827）。本机有其它负载时波动明显。基准取 3 次中位数，
+4. **CPU RTFx 噪声大**（485–827）。本机有其它负载时波动明显。基准取 3 次中位数，
    且不要在跑其它重任务时测。
-4. **PowerShell 不支持 heredoc**（`<<EOF`），写多行文件用 here-string `@' ... '@`。
-5. `src/gpu.rs` 的 `GpuVad`（逐帧路径）**无人调用**，改它不会影响任何测量结果。
+5. **PowerShell 不支持 heredoc**（`<<EOF`），写多行文件用 here-string `@' ... '@`。
+6. `src/gpu.rs` 的 `GpuVad`（逐帧路径）**无人调用**，改它不会影响任何测量结果。
    header 注释写着"后端强制 Vulkan"，但 `backend_from_env` 实际默认 `PRIMARY` —— 该注释已过时。
-6. 长音频 fixture 很大（`v01.f32` = 97 MB）。`cargo test` 用的 `tests/long_audio.rs` 选的是
+7. 长音频 fixture 很大（`v01.f32` = 97 MB）。`cargo test` 用的 `tests/long_audio.rs` 选的是
    `v02`（25842 帧 / 52 MB），因为发散要 ~frame 13000 才暴露时间戳翻转，`v05`/`v07` 太短抓不到。
+8. **数值逐位等价的改法清单**（本轮验证过的安全手法，改之前先对照）：
+   线程↔行的映射重排（每行算式不变）、纯 host 侧缓冲区重排（如 conv 权重 [co][ic][k]→[co][k][ic]、
+   whh 预转置）、load 时机重排（软件流水/预取，值与界内性不变）、prob 拆成独立批量 kernel
+   （乘积先存 workgroup、线程 0 顺序累加的结构照搬）。每改一次，用
+   `trace -- video v01 --dump` 与旧实现字节比对 + 双卡 align 验证。
 
 ---
 
@@ -332,6 +355,10 @@ $env:SILERO_ADAPTER="NVIDIA"; cargo run --release --features gpu --bin bench
 
 ## 11. 尚未提交 / 可选后续
 
-- `master` 领先 `origin/master` 3 个提交，**未 push**。是否推送由维护者决定。
-- `e79bc4c` 引入的 `dbgint.rs` / `dbgint_ref.py` 是上一轮遗留的调试工具，
-  单独成 commit 便于区分；若不需要可 `git reset --hard HEAD~2` 撤掉两个 commit 后重放。
+- `master` 领先 `origin/master` 4 个提交，**未 push**。是否推送由维护者决定。
+- `e79bc4c` 引入的 `dbgint.rs` / `dbgint_ref.py` 是上上轮遗留的调试工具，单独成 commit 便于区分。
+- 2026-09 优化（conv 重排/软件流水 + prob 批量 kernel）为纯内部改动，公开 API 未变。
+  后续可选：conv 的 8 深软件流水（本机收益递减）；公开 API 若要保持与原版对齐，
+  **不要**在此之上加新接口（教训见 git log）。
+- §9.1 的教训值得记住：**Intel 上 GPU timestamp 的占比会撒谎**，已有后来者想"优化 LSTM"
+  的话，先让他看 §9。
