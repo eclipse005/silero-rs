@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 
 const WGSL_TEMPLATE: &str = include_str!("gpu_batch.wgsl");
+/// 厂商无关超越函数层，见 `wgsl_math.wgsl` 头注。
+const WGSL_MATH: &str = include_str!("wgsl_math.wgsl");
 pub const MAX_T: usize = 512;
 /// LSTM 递归每 dispatch 串行处理的帧数：发射次数 512 → MAX_T/LSTM_CHUNK。
 /// 每帧计算量仅 ~65K MAC，发射开销（~50µs/次）远大于计算；kernel 内 for 循环递归。
@@ -107,13 +109,8 @@ impl GpuBatch {
             backends: crate::gpu::backend_from_env(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-            apply_limit_buckets: false,
-        }))
-        .expect("no vulkan adapter");
+        let adapter = crate::gpu::pick_adapter(&instance);
+        crate::gpu::maybe_log_adapter(&adapter);
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("silero-batch"),
@@ -658,7 +655,8 @@ impl GpuBatch {
 
     fn build_pipelines(&mut self, t: usize) {
         let offs = w_offsets();
-        let mut src = WGSL_TEMPLATE.replace("{BATCH}", &t.to_string());
+        let mut src = format!("{}\n{}", WGSL_MATH, WGSL_TEMPLATE);
+        src = src.replace("{BATCH}", &t.to_string());
         src = src.replace("{LSTM_CHUNK}", &LSTM_CHUNK.to_string());
         // 为每个 chunk 生成入口点：lstm_chunk_i 处理帧 [i*CHUNK, i*CHUNK+CHUNK)
         let chunks_src: String = (0..MAX_T / LSTM_CHUNK)

@@ -186,13 +186,13 @@ fn main_point(@builtin(global_invocation_id) gid: vec3<u32>) {
     let j = gid.x;
     pt_gates[512] = 0.0;
     if (j >= 128u) { return; }
-    let i = 1.0 / (1.0 + exp(-pt_gates[j]));
-    let f = 1.0 / (1.0 + exp(-pt_gates[128u + j]));
-    let g = tanh(pt_gates[256u + j]);
-    let o = 1.0 / (1.0 + exp(-pt_gates[384u + j]));
+    let i = tf_sigmoid(pt_gates[j]);
+    let f = tf_sigmoid(pt_gates[128u + j]);
+    let g = tf_tanh(pt_gates[256u + j]);
+    let o = tf_sigmoid(pt_gates[384u + j]);
     let cn = f * pt_c[j] + i * g;
     pt_c[j] = cn;
-    pt_h[j] = o * tanh(cn);
+    pt_h[j] = o * tf_tanh(cn);
 }
 
 // ---------- final: relu(h) → conv1x1 → sigmoid ----------
@@ -208,6 +208,6 @@ fn main_final() {
     for (var j = 0u; j < 128u; j = j + 1u) {
         z = z + fin_w[j] * max(fin_h[j], 0.0);
     }
-    fin_out[0] = 1.0 / (1.0 + exp(-z));
+    fin_out[0] = tf_sigmoid(z);
 }
 

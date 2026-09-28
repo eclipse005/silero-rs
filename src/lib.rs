@@ -11,6 +11,7 @@
 //! - W_8k `ref/weights_jit8k.safetensors`：jit 8k 分支
 
 pub mod timestamps;
+pub mod transcendental;
 pub mod vad_iterator;
 
 #[cfg(feature = "gpu")]
@@ -322,10 +323,10 @@ impl SileroVad {
         for j in 0..128 {
             let i = sigmoid(self.gates[j]);
             let f = sigmoid(self.gates[128 + j]);
-            let g = self.gates[256 + j].tanh();
+            let g = tanh(self.gates[256 + j]);
             let o = sigmoid(self.gates[384 + j]);
             self.cn[j] = f * self.c[j] + i * g;
-            self.hn[j] = o * self.cn[j].tanh();
+            self.hn[j] = o * tanh(self.cn[j]);
         }
         std::mem::swap(&mut self.h, &mut self.hn);
         std::mem::swap(&mut self.c, &mut self.cn);
@@ -345,9 +346,16 @@ impl SileroVad {
     }
 }
 
+/// 概率激活。用 [`transcendental`] 的厂商无关实现而非 `f32::exp`：
+/// 硬件 `exp` 跨厂商差 1–2 ULP，会被 LSTM 递归指数放大（见 transcendental 模块文档）。
 #[inline]
 fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    transcendental::sigmoid(x)
+}
+
+#[inline]
+fn tanh(x: f32) -> f32 {
+    transcendental::tanh(x)
 }
 
 /// conv1d(k=3, pad=1)：输入 (T_in, IC) 行主序，权重预转置 (OC, 3, IC)，

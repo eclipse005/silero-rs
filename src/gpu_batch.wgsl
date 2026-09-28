@@ -183,6 +183,15 @@ fn main_gates_in(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 var<workgroup> wg_g: array<f32, 512>;
 var<workgroup> wg_red: array<f32, 128>;
+// 跨帧递归状态放 workgroup 内存：规范只保证 workgroupBarrier 同步 **workgroup
+// 内存**的可见性，不保证同一 dispatch 内跨帧读写 storage buffer 的可见性
+//（那是 dispatch 之间的隐式屏障负责的事）。把 h/c 放进 workgroup 内存后，跨帧
+// 递归状态完全落在规范强保证的范围内，chunk 首尾与 b_h/b_c 搬运一次。
+// 注：这本身**不是**「Intel 发散」的根因 —— 实测单独加上它并不能修好，真正的
+// 根因是硬件 exp/tanh 跨厂商差 1–2 ULP（见 wgsl_math.wgsl 头注）。此处改动是
+// 顺带消除一处规范层面的隐患。
+var<workgroup> wg_h: array<f32, 128>;
+var<workgroup> wg_c: array<f32, 128>;
 
 const LSTM_CHUNK: u32 = {LSTM_CHUNK}u;
 
@@ -190,9 +199,14 @@ const LSTM_CHUNK: u32 = {LSTM_CHUNK}u;
 // barrier2 后无人再读 wg_g；wg_red 的跨帧读写被 r0 程序序 + 下帧 barrier1 隔开）
 fn chunk_impl(d0: u32, r: u32) {
     b_gin_all[d0 * 576u + 512u] = 0.0; // 垫片：保持 STORE 语义
+    if (r < 128u) {
+        wg_h[r] = b_h[r];
+        wg_c[r] = b_c[r];
+    }
+    workgroupBarrier();
     for (var fi = 0u; fi < LSTM_CHUNK; fi = fi + 1u) {
         let d = d0 + fi;
-        if (d >= BATCH) { return; }
+        if (d >= BATCH) { break; } // uniform：全员跳出并执行 chunk 尾的 h/c 写回
         // gates：whh 预转置 (k,r) + 8 路展开 —— 单 workgroup 延迟暴露，
         // 8 个独立累加器让 8 个 L2 加载在飞，消去逐迭代串行等待
         for (var half = 0u; half < 2u; half = half + 1u) {
@@ -203,14 +217,14 @@ fn chunk_impl(d0: u32, r: u32) {
             var k = 0u;
             loop {
                 if (k >= 128u) { break; }
-                a0 = a0 + b_w[OFF_WHH + (k) * 512u + row] * b_h[k];
-                a1 = a1 + b_w[OFF_WHH + (k + 1u) * 512u + row] * b_h[k + 1u];
-                a2 = a2 + b_w[OFF_WHH + (k + 2u) * 512u + row] * b_h[k + 2u];
-                a3 = a3 + b_w[OFF_WHH + (k + 3u) * 512u + row] * b_h[k + 3u];
-                a4 = a4 + b_w[OFF_WHH + (k + 4u) * 512u + row] * b_h[k + 4u];
-                a5 = a5 + b_w[OFF_WHH + (k + 5u) * 512u + row] * b_h[k + 5u];
-                a6 = a6 + b_w[OFF_WHH + (k + 6u) * 512u + row] * b_h[k + 6u];
-                a7 = a7 + b_w[OFF_WHH + (k + 7u) * 512u + row] * b_h[k + 7u];
+                a0 = a0 + b_w[OFF_WHH + (k) * 512u + row] * wg_h[k];
+                a1 = a1 + b_w[OFF_WHH + (k + 1u) * 512u + row] * wg_h[k + 1u];
+                a2 = a2 + b_w[OFF_WHH + (k + 2u) * 512u + row] * wg_h[k + 2u];
+                a3 = a3 + b_w[OFF_WHH + (k + 3u) * 512u + row] * wg_h[k + 3u];
+                a4 = a4 + b_w[OFF_WHH + (k + 4u) * 512u + row] * wg_h[k + 4u];
+                a5 = a5 + b_w[OFF_WHH + (k + 5u) * 512u + row] * wg_h[k + 5u];
+                a6 = a6 + b_w[OFF_WHH + (k + 6u) * 512u + row] * wg_h[k + 6u];
+                a7 = a7 + b_w[OFF_WHH + (k + 7u) * 512u + row] * wg_h[k + 7u];
                 k = k + 8u;
             }
             gh = gh + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
@@ -219,14 +233,14 @@ fn chunk_impl(d0: u32, r: u32) {
         workgroupBarrier();
         if (r < 128u) {
             let j = r;
-            let i = 1.0 / (1.0 + exp(-wg_g[j]));
-            let f = 1.0 / (1.0 + exp(-wg_g[128u + j]));
-            let g = tanh(wg_g[256u + j]);
-            let o = 1.0 / (1.0 + exp(-wg_g[384u + j]));
-            let cn = f * b_c[j] + i * g;
-            b_c[j] = cn;
-            let hn = o * tanh(cn);
-            b_h[j] = hn;
+            let i = tf_sigmoid(wg_g[j]);
+            let f = tf_sigmoid(wg_g[128u + j]);
+            let g = tf_tanh(wg_g[256u + j]);
+            let o = tf_sigmoid(wg_g[384u + j]);
+            let cn = f * wg_c[j] + i * g;
+            wg_c[j] = cn;
+            let hn = o * tf_tanh(cn);
+            wg_h[j] = hn;
             wg_red[j] = b_w[OFF_FW + j] * max(hn, 0.0);
         }
         workgroupBarrier();
@@ -235,8 +249,13 @@ fn chunk_impl(d0: u32, r: u32) {
             for (var j = 0u; j < 128u; j = j + 1u) {
                 z = z + wg_red[j];
             }
-            b_prob_all[d * 64u] = 1.0 / (1.0 + exp(-z));
+            b_prob_all[d * 64u] = tf_sigmoid(z);
         }
+    }
+    // chunk 结束：workgroup → storage（chunk 间 dispatch 隐式屏障保证可见）
+    if (r < 128u) {
+        b_h[r] = wg_h[r];
+        b_c[r] = wg_c[r];
     }
 }
 
