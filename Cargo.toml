@@ -1,0 +1,31 @@
+[package]
+name = "silero-vad-wgpu"
+version = "0.1.0"
+edition = "2021"
+description = "Silero VAD ported to Rust: dependency-free hand-written kernels, host CPU (SIMD) and wgpu GPU (Vulkan/Metal/DX12) backends, speech-timestamp aligned with the Python original"
+license = "MIT"
+keywords = ["vad", "voice-activity-detection", "audio", "speech", "wgpu"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+safetensors = "0.4"
+hound = "3.5"
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
+
+[features]
+gpu = ["dep:wgpu", "dep:pollster"]
+
+[[bin]]
+name = "silero-vad"
+path = "src/bin/silero-vad.rs"
+required-features = []
+
+[[bin]]
+name = "align"
+path = "src/bin/align.rs"
+required-features = ["gpu"]
+
+[profile.release]
+lto = true
+codegen-units = 1

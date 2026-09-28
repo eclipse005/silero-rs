@@ -1,0 +1,13 @@
+# Rust
+/target
+
+# Local data: golden fixtures, exported weights, video fixtures (regenerable
+# via the python tooling; see README "Correctness")
+/ref
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs / temp
+*.log
