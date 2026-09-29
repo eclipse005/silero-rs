@@ -96,7 +96,7 @@ Vulkan    Loader 1.4.313.0 (C:\Windows\System32\vulkan-1.dll)
 | 文件 | 作用 |
 |---|---|
 | `src/lib.rs` | host CPU 路径（SIMD）、`SileroVad`、`Weights`、`CFG_16K/8K` |
-| `src/gpu.rs` | **逐帧** GPU 路径 `GpuVad`（`gpu.wgsl`，8 dispatch/帧）。**当前无任何 bin 引用，是死代码** |
+| `src/gpu.rs` | GPU 公共设施（后端/适配器选择、诊断打印），供 `gpu_batch` 与各 bin 使用。逐帧 `GpuVad` + `gpu.wgsl` 已删除（Intel 发散诊断使命完成，git 历史保留） |
 | `src/gpu_batch.rs` | **批量** GPU 路径 `GpuBatch`（`gpu_batch.wgsl`）。CLI / align / bench 实际走的路径 |
 | `src/gpu_batch.wgsl` | 批量 kernels（模板，`{BATCH}`/`{LSTM_CHUNKS}` 等占位由 Rust 注入） |
 | `src/wgsl_math.wgsl` | 厂商无关超越函数层，注入到上面两个 shader 前面 |
@@ -313,8 +313,10 @@ cargo build --release --features gpu   # 输出里应出现 "Compiling silero-va
 4. **CPU RTFx 噪声大**（485–827）。本机有其它负载时波动明显。基准取 3 次中位数，
    且不要在跑其它重任务时测。
 5. **PowerShell 不支持 heredoc**（`<<EOF`），写多行文件用 here-string `@' ... '@`。
-6. `src/gpu.rs` 的 `GpuVad`（逐帧路径）**无人调用**，改它不会影响任何测量结果。
-   header 注释写着"后端强制 Vulkan"，但 `backend_from_env` 实际默认 `PRIMARY` —— 该注释已过时。
+6. `src/gpu.rs` 的逐帧 `GpuVad` + `gpu.wgsl` **已删除**（含 gate 的流式 GPU 臂、trace 的
+   `--framewise`）。历史上 HANDOFF 写过"无人调用"，实际 gate/trace 诊断臂在用——该说法
+   曾经过时；诊断使命（Intel 发散定位）完成后连同调用点一起删除，git 历史保留。
+   现 `src/gpu.rs` 只剩后端/适配器公共设施；改它仍不会影响任何测量结果。
 7. 长音频 fixture 很大（`v01.f32` = 97 MB）。`cargo test` 用的 `tests/long_audio.rs` 选的是
    `v02`（25842 帧 / 52 MB），因为发散要 ~frame 13000 才暴露时间戳翻转，`v05`/`v07` 太短抓不到。
 8. **数值逐位等价的改法清单**（本轮验证过的安全手法，改之前先对照）：

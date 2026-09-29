@@ -206,3 +206,76 @@ pub fn speech_timestamps_from_probs(
 
     speeches
 }
+
+#[cfg(test)]
+mod state_machine_fuzz {
+    //! 与 Python 原版的差分模糊测试：语料 `tests/data/state_machine_fuzz.json`
+    //! 由 `state_machine_fuzz_gen.py` 生成（期望输出即原版
+    //! get_speech_timestamps_from_probs 的结果），回放要求逐位一致。
+    //! 覆盖 threshold/neg_threshold 的 f32 邻域、min_silence/min_speech 恰好整数窗
+    //! （== 走边界分支）、max_speech 切割（possible_ends 空/非空 × use_max_poss_sil
+    //! true/false）、pad 0/30/77ms、audio_length_samples 截断、8k、空/单帧等分支。
+
+    use super::{speech_timestamps_from_probs, TsParams};
+
+    // 语料不入库（.gitignore: tests/data/），本地由 state_machine_fuzz_gen.py 生成；
+    // 缺失时跳过而非编译失败——语料属于本地测试数据，不是构建依赖。
+    fn corpus() -> Option<String> {
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/state_machine_fuzz.json"
+        ))
+        .ok()
+    }
+
+    #[test]
+    fn offline_replay_matches_python_bit_exact() {
+        let Some(corpus) = corpus() else {
+            eprintln!("skip: 语料缺失——用 state_machine_fuzz_gen.py 重新生成后可回放");
+            return;
+        };
+        let corpus: serde_json::Value = serde_json::from_str(&corpus).unwrap();
+        let cases = corpus["offline"].as_array().unwrap();
+        assert!(cases.len() >= 200, "corpus too small: {}", cases.len());
+        let mut segments = 0usize;
+        for case in cases {
+            let probs: Vec<f32> = case["probs_bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|b| f32::from_bits(b.as_u64().unwrap() as u32))
+                .collect();
+            let p = &case["params"];
+            let params = TsParams {
+                threshold: p["threshold"].as_f64().unwrap(),
+                min_speech_duration_ms: p["min_speech_duration_ms"].as_f64().unwrap(),
+                max_speech_duration_s: p["max_speech_duration_s"]
+                    .as_f64()
+                    .unwrap_or(f64::INFINITY), // null → 原版 float('inf')
+                min_silence_duration_ms: p["min_silence_duration_ms"].as_f64().unwrap(),
+                speech_pad_ms: p["speech_pad_ms"].as_f64().unwrap(),
+                neg_threshold: p["neg_threshold"].as_f64(),
+                min_silence_at_max_speech: p["min_silence_at_max_speech"].as_f64().unwrap(),
+                use_max_poss_sil_at_max_speech: p["use_max_poss_sil_at_max_speech"]
+                    .as_bool()
+                    .unwrap(),
+            };
+            let sr = p["sampling_rate"].as_i64().unwrap();
+            let window = if sr == 16000 { 512 } else { 256 }; // 原版硬编码
+            let audio_len = case["audio_length_samples"].as_i64();
+            let got = speech_timestamps_from_probs(&probs, sr, window, audio_len, &params);
+            let want: Vec<(i64, i64)> = case["expected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| {
+                    let pair = d.as_array().unwrap();
+                    (pair[0].as_i64().unwrap(), pair[1].as_i64().unwrap())
+                })
+                .collect();
+            segments += want.len();
+            assert_eq!(got, want, "case {}", case["name"].as_str().unwrap());
+        }
+        assert!(segments >= 300, "coverage too thin: {segments} segments");
+    }
+}

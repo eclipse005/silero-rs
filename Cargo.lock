@@ -753,6 +753,7 @@ dependencies = [
  "hound",
  "pollster",
  "safetensors",
+ "serde_json",
  "wgpu",
 ]
 

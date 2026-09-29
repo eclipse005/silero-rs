@@ -91,7 +91,6 @@ pub struct GpuBatch {
     batch_bgs: Vec<Vec<wgpu::BindGroup>>,
     // lstm chunk 的 bind group（gin/h_all/W 全整块，1 个）
     lstm_bg: wgpu::BindGroup,
-    step_bgl: wgpu::BindGroupLayout,
     pl_layout: wgpu::PipelineLayout,
     // 一层深流水线：已提交未读回的批
     inflight: Option<Inflight>,
@@ -304,7 +303,6 @@ impl GpuBatch {
             pipelines: HashMap::new(),
             batch_bgs,
             lstm_bg,
-            step_bgl,
             pl_layout,
             inflight: None,
             flip: 0,

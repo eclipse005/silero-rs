@@ -4,6 +4,7 @@
 # Local data: golden fixtures, exported weights, video fixtures (regenerable
 # via the python tooling; see README "Correctness")
 /ref
+/tests/data
 
 # Python
 __pycache__/

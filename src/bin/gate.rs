@@ -250,11 +250,7 @@ fn crate_gpu_arm(
     params: &TsParams,
     do_bench: bool,
 ) -> Result<(f32, bool, f64), String> {
-    if std::env::args().any(|a| a == "--gpu-batch") {
-        crate_gpu_batch_arm(ref_dir, v, params, do_bench)
-    } else {
-        crate_gpu_stream_arm(ref_dir, v, params, do_bench)
-    }
+    crate_gpu_batch_arm(ref_dir, v, params, do_bench)
 }
 
 /// 批量 GPU 臂：BATCH=512 帧一次提交（本项目 GPU 主战场，对标 sequence 语义）。
@@ -296,7 +292,7 @@ fn crate_gpu_batch_arm(
             golden_ts_raw.chunks_exact(2).map(|c| (c[0], c[1])).collect();
 
         let n_frames = (wav.len() + frame - 1) / frame;
-        let mut run = |gb: &mut GpuBatch, probs: &mut Vec<f32>| {
+        let run = |gb: &mut GpuBatch, probs: &mut Vec<f32>| {
             gb.reset();
             let mut ctx = vec![0.0f32; v.cfg.ctx];
             let mut x_all = vec![0.0f32; MAX_T * v.cfg.x_len()];
@@ -388,121 +384,6 @@ fn crate_gpu_batch_arm(
             for _ in 0..5 {
                 let t0 = std::time::Instant::now();
                 run(&mut gb, &mut Vec::new());
-                walls.push(t0.elapsed().as_secs_f64());
-            }
-            walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let dur = wav.len() as f64 / v.cfg.sr as f64;
-            rtfx.push(dur / walls[walls.len() / 2]);
-        }
-    }
-    let rtfx_med = if rtfx.is_empty() {
-        f64::NAN
-    } else {
-        let mut r = rtfx.clone();
-        r.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        r[r.len() / 2]
-    };
-    Ok((max_diff, ts_all_ok, rtfx_med))
-}
-
-/// 流式 GPU 臂（一层深流水线）。
-#[cfg(feature = "gpu")]
-fn crate_gpu_stream_arm(
-    ref_dir: &std::path::Path,
-    v: &Variant,
-    params: &TsParams,
-    do_bench: bool,
-) -> Result<(f32, bool, f64), String> {
-    let weights = Weights::load(
-        ref_dir
-            .join(v.weights)
-            .to_str()
-            .ok_or("weights path")?,
-    )
-    .map_err(|e| e.to_string())?;
-    let mut gv = silero_vad_wgpu::gpu::GpuVad::new(&weights);
-    let vdir = ref_dir.join("gate").join(v.name);
-    let frame = v.cfg.frame as usize;
-    let mut max_diff = 0.0f32;
-    let mut ts_all_ok = true;
-    let mut rtfx = Vec::new();
-    // 复用 CPU 臂已读的文件列表：直接扫目录
-    let mut names: Vec<String> = std::fs::read_dir(vdir.join("."))
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| {
-            let p = e.ok()?.path();
-            let n = p.file_name()?.to_str()?.to_string();
-            n.strip_suffix(".wav.f32").map(|s| s.to_string())
-        })
-        .collect();
-    names.sort();
-    for name in names {
-        let wav = read_f32(&vdir.join(format!("{name}.wav.f32")));
-        let golden_probs = read_f32(&vdir.join(format!("{name}.probs.f32")));
-        let golden_ts_raw = read_i64(&vdir.join(format!("{name}.ts.i64")));
-        let golden_ts: Vec<(i64, i64)> =
-            golden_ts_raw.chunks_exact(2).map(|c| (c[0], c[1])).collect();
-
-        let n_frames = (wav.len() + frame - 1) / frame;
-        let mut probs = Vec::with_capacity(n_frames);
-        let mut buf = vec![0.0f32; frame];
-        let mut x640 = vec![0.0f32; v.cfg.x_len()];
-        let mut ctx = vec![0.0f32; v.cfg.ctx];
-        let mut run = |gv: &mut silero_vad_wgpu::gpu::GpuVad, probs: &mut Vec<f32>| {
-            gv.reset();
-            // 冲掉上一个流可能遗留的 pending（概率属于旧流，丢弃）
-            let _ = gv.flush();
-            ctx.fill(0.0);
-            // context 在 host 侧管理（与 host 路径一致）：每帧后更新为 chunk 尾部。
-            // 流水线语义：frame_pipelined 返回上一帧概率，首帧 None，末尾 flush 补齐。
-            for f in 0..n_frames {
-                let start = f * frame;
-                let end = (start + frame).min(wav.len());
-                buf[..end - start].copy_from_slice(&wav[start..end]);
-                buf[end - start..].fill(0.0);
-                x640[..v.cfg.ctx].copy_from_slice(&ctx);
-                x640[v.cfg.ctx..v.cfg.ctx + frame].copy_from_slice(&buf);
-                for i in 0..v.cfg.pad {
-                    x640[v.cfg.ctx + frame + i] = x640[v.cfg.ctx + frame - 2 - i];
-                }
-                if let Some(p) = gv.frame_pipelined(&x640) {
-                    probs.push(p);
-                }
-                let tail = frame - v.cfg.ctx;
-                ctx.copy_from_slice(&buf[tail..]);
-            }
-            if let Some(p) = gv.flush() {
-                probs.push(p);
-            }
-        };
-        run(&mut gv, &mut probs);
-
-        if probs.len() != golden_probs.len() {
-            return Err(format!("{name}: frame count mismatch"));
-        }
-        max_diff = probs
-            .iter()
-            .zip(&golden_probs)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max)
-            .max(max_diff);
-        let ts = speech_timestamps_from_probs(
-            &probs,
-            v.cfg.sr as i64,
-            v.cfg.frame as i64,
-            Some(probs.len() as i64 * v.cfg.frame as i64),
-            params,
-        );
-        ts_all_ok &= ts == golden_ts;
-
-        if do_bench {
-            for _ in 0..1 {
-                run(&mut gv, &mut Vec::new());
-            }
-            let mut walls = Vec::new();
-            for _ in 0..5 {
-                let t0 = std::time::Instant::now();
-                run(&mut gv, &mut Vec::new());
                 walls.push(t0.elapsed().as_secs_f64());
             }
             walls.sort_by(|a, b| a.partial_cmp(b).unwrap());

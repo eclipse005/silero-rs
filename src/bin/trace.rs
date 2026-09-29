@@ -26,27 +26,8 @@ fn read_i64(path: &std::path::Path) -> Vec<i64> {
         .collect()
 }
 
-/// 逐帧 GpuVad 路径（gpu.wgsl，8 dispatch/帧，独立实现）跑同一段音频。
-/// 与 GpuBatch 对照可判别：两条路径都发散 = 驱动/精度层面；只有 batch 发散 = 批量 kernel。
-fn stream_framewise(wav: &[f32], weights: &Weights) -> Vec<f32> {
-    use silero_vad_wgpu::gpu::GpuVad;
-    let mut gv = GpuVad::new(weights);
-    let n = wav.len().div_ceil(512);
-    let mut out = Vec::with_capacity(n);
-    let mut buf = vec![0.0f32; 512];
-    for f in 0..n {
-        let s = f * 512;
-        let e = (s + 512).min(wav.len());
-        buf[..e - s].copy_from_slice(&wav[s..e]);
-        buf[e - s..].fill(0.0);
-        out.push(gv.frame(&buf));
-    }
-    out
-}
-
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
-    let framewise = a.iter().any(|x| x == "--framewise");
     let dump = a
         .iter()
         .position(|x| x == "--dump")
@@ -54,7 +35,7 @@ fn main() {
         .cloned();
     let a: Vec<&String> = a
         .iter()
-        .filter(|x| *x != "--framewise" && *x != "--dump")
+        .filter(|x| *x != "--dump")
         .collect();
     let (kind, name) = if a.len() >= 2 {
         (a[0].clone(), a[1].clone())
@@ -97,13 +78,8 @@ fn main() {
     silero_vad_wgpu::gpu::maybe_dump_adapters();
 
     let mut gb = GpuBatch::new(&Weights::load(wstr).expect("weights"));
-    let pd = if framewise {
-        println!("mode: 逐帧 GpuVad (gpu.wgsl)");
-        stream_framewise(&wav, &Weights::load(wstr).expect("weights"))
-    } else {
-        println!("mode: 批量 GpuBatch (gpu_batch.wgsl)");
-        gb.stream(&wav)
-    };
+    println!("mode: 批量 GpuBatch (gpu_batch.wgsl)");
+    let pd = gb.stream(&wav);
     assert_eq!(pd.len(), pg.len(), "frame count mismatch");
 
     if let Some(path) = dump.as_deref() {
