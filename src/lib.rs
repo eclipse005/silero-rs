@@ -170,26 +170,89 @@ fn simd_enabled() -> bool {
 unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps};
     let n = a.len();
-    let mut acc = _mm256_setzero_ps();
+    // 4 路独立累加器：打破单链 FMA 延迟（256 点积从 32 拍串行降为 8 拍×4 路并行）。
+    // 累加顺序改变（ULP 级），与 GPU 路径同理需长音频对齐验证。
+    let mut a0 = _mm256_setzero_ps();
+    let mut a1 = _mm256_setzero_ps();
+    let mut a2 = _mm256_setzero_ps();
+    let mut a3 = _mm256_setzero_ps();
     let mut i = 0;
+    while i + 32 <= n {
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(i)), _mm256_loadu_ps(b.as_ptr().add(i)), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(i + 8)), _mm256_loadu_ps(b.as_ptr().add(i + 8)), a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(i + 16)), _mm256_loadu_ps(b.as_ptr().add(i + 16)), a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(i + 24)), _mm256_loadu_ps(b.as_ptr().add(i + 24)), a3);
+        i += 32;
+    }
     while i + 8 <= n {
-        acc = _mm256_fmadd_ps(
-            _mm256_loadu_ps(a.as_ptr().add(i)),
-            _mm256_loadu_ps(b.as_ptr().add(i)),
-            acc,
-        );
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(i)), _mm256_loadu_ps(b.as_ptr().add(i)), a0);
         i += 8;
     }
-    // 固定顺序水平归约：((l0+l1)+(l2+l3)) + ((l4+l5)+(l6+l7))
-    let arr: [f32; 8] = std::mem::transmute(acc);
-    let mut s = (arr[0] + arr[1]) + (arr[2] + arr[3]);
-    s += (arr[4] + arr[5]) + (arr[6] + arr[7]);
+    let hsum = |v: std::arch::x86_64::__m256| -> f32 {
+        let arr: [f32; 8] = std::mem::transmute(v);
+        (arr[0] + arr[1]) + (arr[2] + arr[3]) + ((arr[4] + arr[5]) + (arr[6] + arr[7]))
+    };
+    let mut s = hsum(a0);
+    s = (s + hsum(a1)) + (hsum(a2) + hsum(a3));
     let mut tail = 0.0f32;
     while i < n {
         tail += a[i] * b[i];
         i += 1;
     }
     s + tail
+}
+
+/// STFT 专用：re/im 两输出共享 win 加载（3 load/拍代替 4），各自 4 路累加链，
+/// 分块与 [`dot_avx2`] 完全一致 → 每个输出的累加顺序与单独调用 dot 相同。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot2_avx2(win: &[f32], bre: &[f32], bim: &[f32]) -> (f32, f32) {
+    use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps};
+    let n = win.len();
+    let (mut r0, mut r1, mut r2, mut r3) = (
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+    );
+    let (mut i0, mut i1, mut i2, mut i3) = (
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+    );
+    let mut k = 0;
+    while k + 32 <= n {
+        let x0 = _mm256_loadu_ps(win.as_ptr().add(k));
+        let x1 = _mm256_loadu_ps(win.as_ptr().add(k + 8));
+        let x2 = _mm256_loadu_ps(win.as_ptr().add(k + 16));
+        let x3 = _mm256_loadu_ps(win.as_ptr().add(k + 24));
+        r0 = _mm256_fmadd_ps(_mm256_loadu_ps(bre.as_ptr().add(k)), x0, r0);
+        r1 = _mm256_fmadd_ps(_mm256_loadu_ps(bre.as_ptr().add(k + 8)), x1, r1);
+        r2 = _mm256_fmadd_ps(_mm256_loadu_ps(bre.as_ptr().add(k + 16)), x2, r2);
+        r3 = _mm256_fmadd_ps(_mm256_loadu_ps(bre.as_ptr().add(k + 24)), x3, r3);
+        i0 = _mm256_fmadd_ps(_mm256_loadu_ps(bim.as_ptr().add(k)), x0, i0);
+        i1 = _mm256_fmadd_ps(_mm256_loadu_ps(bim.as_ptr().add(k + 8)), x1, i1);
+        i2 = _mm256_fmadd_ps(_mm256_loadu_ps(bim.as_ptr().add(k + 16)), x2, i2);
+        i3 = _mm256_fmadd_ps(_mm256_loadu_ps(bim.as_ptr().add(k + 24)), x3, i3);
+        k += 32;
+    }
+    while k + 8 <= n {
+        let x = _mm256_loadu_ps(win.as_ptr().add(k));
+        r0 = _mm256_fmadd_ps(_mm256_loadu_ps(bre.as_ptr().add(k)), x, r0);
+        i0 = _mm256_fmadd_ps(_mm256_loadu_ps(bim.as_ptr().add(k)), x, i0);
+        k += 8;
+    }
+    let hsum = |v: std::arch::x86_64::__m256| -> f32 {
+        let arr: [f32; 8] = std::mem::transmute(v);
+        (arr[0] + arr[1]) + (arr[2] + arr[3]) + ((arr[4] + arr[5]) + (arr[6] + arr[7]))
+    };
+    let mut re = hsum(r0);
+    re = (re + hsum(r1)) + (hsum(r2) + hsum(r3));
+    let mut im = hsum(i0);
+    im = (im + hsum(i1)) + (hsum(i2) + hsum(i3));
+    let mut tre = 0.0f32;
+    let mut tim = 0.0f32;
+    while k < n {
+        tre += win[k] * bre[k];
+        tim += win[k] * bim[k];
+        k += 1;
+    }
+    (re + tre, im + tim)
 }
 
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
@@ -293,27 +356,42 @@ impl SileroVad {
         }
 
         // STFT → magnitude (t, cutoff) 行主序（t 主序直接喂 conv）
+        // SIMD 路径：re/im 融合单遍（共享 win 加载，累加顺序与各自 dot 相同）
         let basis = &self.w.basis;
+        let simd = simd_enabled();
         for p in 0..t {
             let w0 = p * cfg.hop;
             let win = &x[w0..w0 + cfg.n_fft];
-            for f in 0..cfg.cutoff {
-                let re = dot(win, &basis[f * cfg.n_fft..(f + 1) * cfg.n_fft]);
-                let im = dot(
-                    win,
-                    &basis[(cfg.cutoff + f) * cfg.n_fft..(cfg.cutoff + f + 1) * cfg.n_fft],
-                );
-                self.mag_t[p * cfg.cutoff + f] = (re * re + im * im).sqrt();
+            if simd {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    for f in 0..cfg.cutoff {
+                        let bre = &basis[f * cfg.n_fft..(f + 1) * cfg.n_fft];
+                        let bim =
+                            &basis[(cfg.cutoff + f) * cfg.n_fft..(cfg.cutoff + f + 1) * cfg.n_fft];
+                        let (re, im) = dot2_avx2(win, bre, bim);
+                        self.mag_t[p * cfg.cutoff + f] = (re * re + im * im).sqrt();
+                    }
+                }
+            } else {
+                for f in 0..cfg.cutoff {
+                    let re = dot(win, &basis[f * cfg.n_fft..(f + 1) * cfg.n_fft]);
+                    let im = dot(
+                        win,
+                        &basis[(cfg.cutoff + f) * cfg.n_fft..(cfg.cutoff + f + 1) * cfg.n_fft],
+                    );
+                    self.mag_t[p * cfg.cutoff + f] = (re * re + im * im).sqrt();
+                }
             }
         }
-
         // encoder：每块 conv → ReLU（窗口点积，零 gather）
         conv3_t(&self.mag_t, t, cfg.cutoff, &self.wt1, &self.w.c1b, 1, true, &mut self.e1_t);
         conv3_t(&self.e1_t, t, 128, &self.wt2, &self.w.c2b, 2, true, &mut self.e2_t);
         conv3_t(&self.e2_t, 2, 64, &self.wt3, &self.w.c3b, 2, true, &mut self.e3_t);
         conv3_t(&self.e3_t, 1, 64, &self.wt4, &self.w.c4b, 1, true, &mut self.e4_t);
 
-        // lstm_cell（块序 i,f,g,o）
+        // lstm_cell（块序 i,f,g,o）。逐行 dot（4 路累加器版）实测优于 (k,r) 转置
+        // 广播方案（e4/h 常驻 L1，权重大块顺序读）。
         let e4 = &self.e4_t;
         for r in 0..512 {
             let gi = dot(&self.w.wih[r * 128..(r + 1) * 128], e4) + self.w.bih[r];
@@ -375,6 +453,13 @@ fn conv3_t(
     debug_assert_eq!(wt.len(), oc * 3 * ic);
     out_t.clear();
     out_t.resize(t_out * oc, 0.0);
+    if simd_enabled() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            conv3_t_avx2(input_t, t_in, ic, wt, b, stride, relu, t_out, oc, out_t);
+        }
+        return;
+    }
     for t in 0..t_out {
         for co in 0..oc {
             let wb = &wt[co * 3 * ic..(co + 1) * 3 * ic];
@@ -387,6 +472,67 @@ fn conv3_t(
                 }
             }
             let v = acc;
+            out_t[t * oc + co] = if relu && v < 0.0 { 0.0 } else { v };
+        }
+    }
+}
+
+/// conv3_t 的 AVX2 路径：每个输出的 3 个 k 点积流过**同一组 4 路累加器**
+/// （旧版每输出 3 次 dot = 3 次水平归约，归约开销是 conv1 的大头）。
+/// 每 k 内 ic 分块顺序与 [`dot_avx2`] 相同；k 间顺序接续；尾部标量累加；
+/// 最终 `(b + h0) + ((h1 + h2) + h3) + tail`。累加顺序与旧版不同（ULP 级）。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn conv3_t_avx2(
+    input_t: &[f32],
+    t_in: usize,
+    ic: usize,
+    wt: &[f32],
+    b: &[f32],
+    stride: usize,
+    relu: bool,
+    t_out: usize,
+    oc: usize,
+    out_t: &mut [f32],
+) {
+    use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps};
+    for t in 0..t_out {
+        for co in 0..oc {
+            let wb = &wt[co * 3 * ic..(co + 1) * 3 * ic];
+            let (mut a0, mut a1, mut a2, mut a3) = (
+                _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+            );
+            let mut tail = 0.0f32;
+            for k in 0..3 {
+                let row = t * stride + k; // 实际输入行 = row - 1
+                if row >= 1 && row <= t_in {
+                    let r = (row - 1) * ic;
+                    let wch = wb.as_ptr().add(k * ic);
+                    let xch = input_t.as_ptr().add(r);
+                    let mut i = 0;
+                    while i + 32 <= ic {
+                        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(wch.add(i)), _mm256_loadu_ps(xch.add(i)), a0);
+                        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(wch.add(i + 8)), _mm256_loadu_ps(xch.add(i + 8)), a1);
+                        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(wch.add(i + 16)), _mm256_loadu_ps(xch.add(i + 16)), a2);
+                        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(wch.add(i + 24)), _mm256_loadu_ps(xch.add(i + 24)), a3);
+                        i += 32;
+                    }
+                    while i + 8 <= ic {
+                        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(wch.add(i)), _mm256_loadu_ps(xch.add(i)), a0);
+                        i += 8;
+                    }
+                    while i < ic {
+                        tail += *wch.add(i) * *xch.add(i);
+                        i += 1;
+                    }
+                }
+            }
+            let hsum = |v: std::arch::x86_64::__m256| -> f32 {
+                let arr: [f32; 8] = std::mem::transmute(v);
+                (arr[0] + arr[1]) + (arr[2] + arr[3]) + ((arr[4] + arr[5]) + (arr[6] + arr[7]))
+            };
+            let h0 = hsum(a0);
+            let v = (b[co] + h0) + ((hsum(a1) + hsum(a2)) + hsum(a3)) + tail;
             out_t[t * oc + co] = if relu && v < 0.0 { 0.0 } else { v };
         }
     }
