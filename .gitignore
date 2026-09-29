@@ -5,6 +5,7 @@
 # via the python tooling; see README "Correctness")
 /ref
 /tests/data
+.zcodeignore
 
 # Python
 __pycache__/
