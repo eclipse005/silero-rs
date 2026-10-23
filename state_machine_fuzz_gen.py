@@ -181,10 +181,18 @@ class FakeModel:
 
 
 def build_iterator_cases():
-    """流式状态机（VADIterator）用例：FakeModel 注入概率，任意窗口长度。"""
+    """流式状态机（VADIterator）用例：FakeModel 注入概率，任意窗口长度。
+
+    th01：threshold=0.1 < 0.16，退出阈值被 floor 到 0.01（原版 PR#805 行为，
+    需原版 ≥ 该 PR 的版本生成，否则期望输出不同）；th08neg4：显式非默认
+    neg_threshold。其余变体的缺省语义 max(threshold - 0.15, 0.01) 在新旧版
+    原版下一致。
+    """
     variants = [
         dict(tag="default"),
         dict(tag="th08", threshold=0.8),
+        dict(tag="th01", threshold=0.1),
+        dict(tag="th08neg4", threshold=0.8, neg_threshold=0.4),
         dict(tag="sil64", min_silence_duration_ms=64),
         dict(tag="sil0", min_silence_duration_ms=0),
         dict(tag="pad0", speech_pad_ms=0),
@@ -196,7 +204,9 @@ def build_iterator_cases():
     for v in variants:
         window = v.get("window_size_samples", 512)
         threshold = v.get("threshold", 0.5)
-        boundary = boundary_values(threshold, max(threshold - 0.15, 0.01))
+        neg = v.get("neg_threshold", None)
+        boundary = boundary_values(
+            threshold, neg if neg is not None else max(threshold - 0.15, 0.01))
         for si in range(30):
             n = int(rng.integers(2, 260))
             if si % 3 == 0:
@@ -212,7 +222,7 @@ def build_iterator_cases():
             it = VADIterator(
                 FakeModel([float(x) for x in probs]), threshold=threshold,
                 sampling_rate=16000, min_silence_duration_ms=v.get("min_silence_duration_ms", 100),
-                speech_pad_ms=v.get("speech_pad_ms", 30))
+                speech_pad_ms=v.get("speech_pad_ms", 30), neg_threshold=neg)
             events = []
             for w in windows:
                 r = it(torch.zeros(w))
@@ -222,6 +232,7 @@ def build_iterator_cases():
             cases.append({
                 "name": f"{v['tag']}_{si}",
                 "threshold": threshold,
+                "neg_threshold": neg,
                 "min_silence_duration_ms": v.get("min_silence_duration_ms", 100),
                 "speech_pad_ms": v.get("speech_pad_ms", 30),
                 "sampling_rate": 16000,

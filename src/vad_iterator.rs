@@ -1,8 +1,10 @@
-//! 原版 `VADIterator`（v6.2.3 的 utils_vad.py）的逐行移植 —— 增量式流状态机。
+//! 原版 `VADIterator`（utils_vad.py，v6.2.3 + PR#805 后的 master）的逐行移植
+//! —— 增量式流状态机。
 //!
 //! 与离线版 [`crate::timestamps`] 的区别：VADIterator 每喂一个窗口就增量输出
 //! Start/End 事件（语音起点 = 当前样本 - speech_pad - 窗长，终点判定用
-//! threshold - 0.15 的滞回 + min_silence），语义与原版逐位一致。
+//! neg_threshold 的滞回（默认 max(threshold - 0.15, 0.01)，可显式指定）
+//! + min_silence），语义与原版逐位一致。
 //!
 //! 注意：事件幅度含 speech_pad_ms 的"超前"（原版如此），流结束时若仍处于
 //! 语音段，原版不会补发 End 事件，本实现保持一致。
@@ -20,6 +22,9 @@ pub enum VadEvent {
 pub struct VadIterator {
     vad: SileroVad,
     threshold: f64,
+    /// 退出阈值（滞回下限）。PR#805 起原版构造参数可显式指定，缺省为
+    /// max(threshold - 0.15, 0.01)——floor 保证低 threshold 下状态机能退出 SPEECH。
+    neg_threshold: f64,
     min_silence_samples: f64,
     speech_pad_samples: f64,
     triggered: bool,
@@ -47,12 +52,20 @@ impl VadIterator {
         Ok(Self {
             vad: SileroVad::new(w, cfg)?,
             threshold,
+            neg_threshold: (threshold - 0.15).max(0.01),
             min_silence_samples: cfg.sr as f64 * min_silence_duration_ms / 1000.0,
             speech_pad_samples: cfg.sr as f64 * speech_pad_ms / 1000.0,
             triggered: false,
             temp_end: 0,
             current_sample: 0,
         })
+    }
+
+    /// 显式指定退出阈值（同原版构造参数 `neg_threshold`，PR#805 加入；
+    /// 缺省为 max(threshold - 0.15, 0.01)）。
+    pub fn with_neg_threshold(mut self, neg_threshold: f64) -> Self {
+        self.neg_threshold = neg_threshold;
+        self
     }
 
     /// 等效原版 reset_states()。
@@ -98,7 +111,7 @@ impl VadIterator {
                 .max(0.0);
             return Some(VadEvent::Start(speech_start as i64));
         }
-        if prob < self.threshold - 0.15 && self.triggered {
+        if prob < self.neg_threshold && self.triggered {
             if self.temp_end == 0 {
                 self.temp_end = self.current_sample;
             }
@@ -167,6 +180,9 @@ mod state_machine_fuzz {
                 case["speech_pad_ms"].as_f64().unwrap(),
             )
             .unwrap();
+            if let Some(neg) = case.get("neg_threshold").and_then(|v| v.as_f64()) {
+                it = it.with_neg_threshold(neg);
+            }
             let mut got: Vec<(i64, i64)> = Vec::new();
             for (i, w) in windows.iter().enumerate() {
                 if let Some(ev) = it.step(probs[i] as f64, *w) {
