@@ -1,0 +1,15 @@
+[package]
+name = "silero-vad-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "Browser bindings for silero-vad-wgpu: speech segments and silence-midpoint cuts"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+silero-vad-wgpu = { path = ".." }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"

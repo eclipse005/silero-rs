@@ -10,6 +10,7 @@
 //! - W_C `models/silero_vad_16k.safetensors`：tinygrad 权重（键名即规范格式）
 //! - W_8k `ref/weights_jit8k.safetensors`：jit 8k 分支
 
+pub mod chunk;
 pub mod timestamps;
 pub mod transcendental;
 pub mod vad_iterator;
@@ -159,9 +160,16 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 fn simd_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("SILERO_SIMD").map(|v| v != "0").unwrap_or(true)
-            && is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("fma")
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::env::var("SILERO_SIMD").map(|v| v != "0").unwrap_or(true)
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
     })
 }
 
